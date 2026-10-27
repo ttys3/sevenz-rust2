@@ -77,3 +77,8 @@ required-features = ["default"]
 
 [package.metadata.docs.rs]
 all-features = true
+
+# `Lzma2ReaderMt::with_memory_budget`, which `set_mt_memory_budget` calls, is not in a
+# lzma-rust2 release yet. Drop this once one has it.
+[patch.crates-io]
+lzma-rust2 = { git = "https://github.com/ttys3/lzma-rust2.git", branch = "feat/asm-lzma-decoder-perf-0.23" }
