@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Added
+
+- `ArchiveReader::set_mt_memory_budget` and `BlockDecoder::set_mt_memory_budget` bound, in bytes,
+  what the multi-threaded LZMA2 decoder holds to decode ahead (`Lzma2ReaderMt::with_memory_budget`).
+  A block whose work units do not fit is decoded on one thread from the unit that does not fit on.
+  The LZMA2 coders of a BCJ2 block share the budget. Without a budget nothing changes.
+
 ## 0.24.1 - 2026-10-18
 
 - Bumped `lzma-rust2` to 0.23.

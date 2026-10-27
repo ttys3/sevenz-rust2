@@ -12,7 +12,12 @@ use crc32fast::Hasher;
 use lzma_rust2::filter::bcj2::Bcj2Reader;
 
 use crate::{
-    ByteReader, Password, archive::*, bitset::BitSet, block::*, decoder::add_decoder, error::Error,
+    ByteReader, Password,
+    archive::*,
+    bitset::BitSet,
+    block::*,
+    decoder::{DecodeOptions, add_decoder},
+    error::Error,
 };
 
 const MAX_MEM_LIMIT_KB: usize = usize::MAX / 1024;
@@ -470,7 +475,7 @@ impl Archive {
                     coder,
                     password,
                     MAX_MEM_LIMIT_KB,
-                    thread_count,
+                    DecodeOptions::threads(thread_count),
                 )?;
                 decoder = Box::new(next);
             }
@@ -1256,6 +1261,7 @@ pub struct ArchiveReader<R: Read + Seek> {
     archive: Archive,
     password: Password,
     thread_count: u32,
+    mt_memory_budget: Option<u64>,
     index: HashMap<String, IndexEntry>,
 }
 
@@ -1281,6 +1287,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
             archive,
             password,
             thread_count: 1,
+            mt_memory_budget: None,
             index: HashMap::default(),
         };
 
@@ -1309,6 +1316,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
             archive,
             password,
             thread_count: 1,
+            mt_memory_budget: None,
             index: HashMap::default(),
         };
 
@@ -1327,6 +1335,25 @@ impl<R: Read + Seek> ArchiveReader<R> {
     /// Defaults to `std::thread::available_parallelism()` if not set manually.
     pub fn set_thread_count(&mut self, thread_count: u32) {
         self.thread_count = thread_count.clamp(1, 256);
+    }
+
+    /// Bounds, in bytes, what a multi-threaded LZMA2 decoder may hold to decode ahead of
+    /// the reader: work units it has read, their output, and the decoder of each (see
+    /// `lzma_rust2::Lzma2ReaderMt::with_memory_budget`). A block whose work units do not
+    /// fit is decoded on one thread from the unit that does not fit on. In a BCJ2 block the
+    /// LZMA2 coders share the budget.
+    ///
+    /// By default there is no budget: the decoder keeps up to `thread_count + 1` whole work
+    /// units in memory, however large they are.
+    pub fn set_mt_memory_budget(&mut self, budget: u64) {
+        self.mt_memory_budget = Some(budget);
+    }
+
+    fn decode_options(&self) -> DecodeOptions {
+        DecodeOptions {
+            threads: self.thread_count,
+            mt_memory_budget: self.mt_memory_budget,
+        }
     }
 
     fn fill_index(&mut self) {
@@ -1357,11 +1384,11 @@ impl<R: Read + Seek> ArchiveReader<R> {
         archive: &Archive,
         block_index: usize,
         password: &Password,
-        thread_count: u32,
+        options: DecodeOptions,
     ) -> Result<Box<dyn Read + 'r>, Error> {
         let block = &archive.blocks[block_index];
         if block.total_input_streams > block.total_output_streams {
-            return Self::build_decode_stack2(source, archive, block_index, password, thread_count);
+            return Self::build_decode_stack2(source, archive, block_index, password, options);
         }
         let first_pack_stream_index = archive.stream_map.block_first_pack_stream_index[block_index];
         let block_offset = SIGNATURE_HEADER_SIZE
@@ -1405,7 +1432,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
                 coder,
                 password,
                 MAX_MEM_LIMIT_KB,
-                thread_count,
+                options,
             )?;
             decoder = Box::new(next);
         }
@@ -1425,7 +1452,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
         archive: &Archive,
         block_index: usize,
         password: &Password,
-        thread_count: u32,
+        options: DecodeOptions,
     ) -> Result<Box<dyn Read + 'r>, Error> {
         const MAX_CODER_COUNT: usize = 32;
         let block = &archive.blocks[block_index];
@@ -1435,6 +1462,13 @@ impl<R: Read + Seek> ArchiveReader<R> {
                 block.coders.len()
             )));
         }
+        // The LZMA2 coders of the block decode their streams side by side.
+        let lzma2_coders = block
+            .coders
+            .iter()
+            .filter(|coder| coder.encoder_method_id() == EncoderMethod::ID_LZMA2)
+            .count();
+        let options = options.shared_by(lzma2_coders);
 
         assert!(block.total_input_streams > block.total_output_streams);
         let shared_source = Rc::new(RefCell::new(source));
@@ -1502,7 +1536,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
             password,
             main_coder_index,
             0,
-            thread_count,
+            options,
         )?;
         if block.has_crc {
             decoder = Box::new(Crc32VerifyingReader::new(
@@ -1521,7 +1555,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
         password: &Password,
         in_stream_index: usize,
         depth: usize,
-        thread_count: u32,
+        options: DecodeOptions,
     ) -> Result<Box<dyn Read + 'r>, Error>
     where
         R: 'r,
@@ -1550,7 +1584,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
             password,
             index,
             depth,
-            thread_count,
+            options,
         )
     }
 
@@ -1561,7 +1595,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
         password: &Password,
         in_stream_index: usize,
         depth: usize,
-        thread_count: u32,
+        options: DecodeOptions,
     ) -> Result<Box<dyn Read + 'r>, Error>
     where
         R: 'r,
@@ -1593,7 +1627,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
                 password,
                 start_index,
                 depth + 1,
-                thread_count,
+                options,
             )?;
 
             let decoder = add_decoder(
@@ -1602,7 +1636,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
                 coder,
                 password,
                 MAX_MEM_LIMIT_KB,
-                thread_count,
+                options,
             )?;
             return Ok(Box::new(decoder));
         }
@@ -1627,7 +1661,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
                     password,
                     i,
                     depth + 1,
-                    thread_count,
+                    options,
                 )?);
             }
             return Ok(Box::new(Bcj2Reader::new(inputs, uncompressed_len)));
@@ -1650,13 +1684,14 @@ impl<R: Read + Seek> ArchiveReader<R> {
     ) -> Result<(), Error> {
         let block_count = self.archive.blocks.len();
         for block_index in 0..block_count {
-            let forder_dec = BlockDecoder::new(
+            let mut forder_dec = BlockDecoder::new(
                 self.thread_count,
                 block_index,
                 &self.archive,
                 &self.password,
                 &mut self.source,
             );
+            forder_dec.mt_memory_budget = self.mt_memory_budget;
             forder_dec.for_each_entries(&mut each)?;
         }
         // decode empty files
@@ -1695,14 +1730,15 @@ impl<R: Read + Seek> ArchiveReader<R> {
                 let mut result = None;
                 let target_file_ptr = file as *const _;
 
-                BlockDecoder::new(
+                let mut block_decoder = BlockDecoder::new(
                     self.thread_count,
                     block_index,
                     &self.archive,
                     &self.password,
                     &mut self.source,
-                )
-                .for_each_entries(&mut |archive_entry, reader| {
+                );
+                block_decoder.mt_memory_budget = self.mt_memory_budget;
+                block_decoder.for_each_entries(&mut |archive_entry, reader| {
                     let mut data = Vec::with_capacity(
                         archive_entry.size.min(MAX_PREALLOC_BYTES as u64) as usize,
                     );
@@ -1728,12 +1764,13 @@ impl<R: Read + Seek> ArchiveReader<R> {
 
                 self.source.seek(SeekFrom::Start(block_offset))?;
 
+                let options = self.decode_options();
                 let mut block_reader = Self::build_decode_stack(
                     &mut self.source,
                     &self.archive,
                     block_index,
                     &self.password,
-                    self.thread_count,
+                    options,
                 )?;
 
                 let mut data =
@@ -1793,6 +1830,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
 /// decoding files from that block.
 pub struct BlockDecoder<'a, R: Read + Seek> {
     thread_count: u32,
+    mt_memory_budget: Option<u64>,
     block_index: usize,
     archive: &'a Archive,
     password: &'a Password,
@@ -1818,6 +1856,7 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
     ) -> Self {
         Self {
             thread_count,
+            mt_memory_budget: None,
             block_index,
             archive,
             password,
@@ -1829,6 +1868,12 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
     /// (currently only LZMA2 if encoded with MT support).
     pub fn set_thread_count(&mut self, thread_count: u32) {
         self.thread_count = thread_count.clamp(1, 256);
+    }
+
+    /// Bounds, in bytes, what a multi-threaded LZMA2 decoder may hold to decode ahead; see
+    /// [`ArchiveReader::set_mt_memory_budget`]. By default there is no budget.
+    pub fn set_mt_memory_budget(&mut self, budget: u64) {
+        self.mt_memory_budget = Some(budget);
     }
 
     /// Returns a slice of archive entries contained in this block.
@@ -1857,18 +1902,18 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
     ) -> Result<bool, Error> {
         let Self {
             thread_count,
+            mt_memory_budget,
             block_index,
             archive,
             password,
             source,
         } = self;
-        let mut block_reader = ArchiveReader::build_decode_stack(
-            source,
-            archive,
-            block_index,
-            password,
-            thread_count,
-        )?;
+        let options = DecodeOptions {
+            threads: thread_count,
+            mt_memory_budget,
+        };
+        let mut block_reader =
+            ArchiveReader::build_decode_stack(source, archive, block_index, password, options)?;
         let start = archive.stream_map.block_first_file_index[block_index];
         let file_count = archive.blocks[block_index].num_unpack_sub_streams;
 
