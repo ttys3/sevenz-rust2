@@ -6,6 +6,7 @@ use std::{
     io::{Read, Seek, SeekFrom},
     num::NonZeroUsize,
     rc::Rc,
+    sync::{Arc, atomic::AtomicBool},
 };
 
 use crc32fast::Hasher;
@@ -475,7 +476,7 @@ impl Archive {
                     coder,
                     password,
                     MAX_MEM_LIMIT_KB,
-                    DecodeOptions::threads(thread_count),
+                    &DecodeOptions::threads(thread_count),
                 )?;
                 decoder = Box::new(next);
             }
@@ -1262,6 +1263,7 @@ pub struct ArchiveReader<R: Read + Seek> {
     password: Password,
     thread_count: u32,
     mt_memory_budget: Option<u64>,
+    cancellation: Option<Arc<AtomicBool>>,
     index: HashMap<String, IndexEntry>,
 }
 
@@ -1288,6 +1290,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
             password,
             thread_count: 1,
             mt_memory_budget: None,
+            cancellation: None,
             index: HashMap::default(),
         };
 
@@ -1317,6 +1320,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
             password,
             thread_count: 1,
             mt_memory_budget: None,
+            cancellation: None,
             index: HashMap::default(),
         };
 
@@ -1349,10 +1353,24 @@ impl<R: Read + Seek> ArchiveReader<R> {
         self.mt_memory_budget = Some(budget);
     }
 
+    /// Sets a flag that cancels multi-threaded LZMA2 decoding. Once it is set, a read that
+    /// waits for one of `lzma_rust2::Lzma2ReaderMt`'s workers returns, within 50 ms, an I/O
+    /// error carrying `lzma_rust2::DecoderCancelled`, and so does every later read of that
+    /// block; the workers stop at the end of the chunk they are decoding.
+    ///
+    /// Without it, such a read returns only once the work unit it waits for is decoded,
+    /// which for the largest units 7-Zip writes (256 MiB) takes seconds. Every other coder,
+    /// and LZMA2 decoded on one thread, returns from each read quickly, so the caller can
+    /// check for cancellation between reads.
+    pub fn set_cancellation(&mut self, flag: Arc<AtomicBool>) {
+        self.cancellation = Some(flag);
+    }
+
     fn decode_options(&self) -> DecodeOptions {
         DecodeOptions {
             threads: self.thread_count,
             mt_memory_budget: self.mt_memory_budget,
+            cancellation: self.cancellation.clone(),
         }
     }
 
@@ -1384,7 +1402,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
         archive: &Archive,
         block_index: usize,
         password: &Password,
-        options: DecodeOptions,
+        options: &DecodeOptions,
     ) -> Result<Box<dyn Read + 'r>, Error> {
         let block = &archive.blocks[block_index];
         if block.total_input_streams > block.total_output_streams {
@@ -1452,7 +1470,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
         archive: &Archive,
         block_index: usize,
         password: &Password,
-        options: DecodeOptions,
+        options: &DecodeOptions,
     ) -> Result<Box<dyn Read + 'r>, Error> {
         const MAX_CODER_COUNT: usize = 32;
         let block = &archive.blocks[block_index];
@@ -1536,7 +1554,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
             password,
             main_coder_index,
             0,
-            options,
+            &options,
         )?;
         if block.has_crc {
             decoder = Box::new(Crc32VerifyingReader::new(
@@ -1555,7 +1573,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
         password: &Password,
         in_stream_index: usize,
         depth: usize,
-        options: DecodeOptions,
+        options: &DecodeOptions,
     ) -> Result<Box<dyn Read + 'r>, Error>
     where
         R: 'r,
@@ -1595,7 +1613,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
         password: &Password,
         in_stream_index: usize,
         depth: usize,
-        options: DecodeOptions,
+        options: &DecodeOptions,
     ) -> Result<Box<dyn Read + 'r>, Error>
     where
         R: 'r,
@@ -1692,6 +1710,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
                 &mut self.source,
             );
             forder_dec.mt_memory_budget = self.mt_memory_budget;
+            forder_dec.cancellation = self.cancellation.clone();
             forder_dec.for_each_entries(&mut each)?;
         }
         // decode empty files
@@ -1738,6 +1757,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
                     &mut self.source,
                 );
                 block_decoder.mt_memory_budget = self.mt_memory_budget;
+                block_decoder.cancellation = self.cancellation.clone();
                 block_decoder.for_each_entries(&mut |archive_entry, reader| {
                     let mut data = Vec::with_capacity(
                         archive_entry.size.min(MAX_PREALLOC_BYTES as u64) as usize,
@@ -1770,7 +1790,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
                     &self.archive,
                     block_index,
                     &self.password,
-                    options,
+                    &options,
                 )?;
 
                 let mut data =
@@ -1831,6 +1851,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
 pub struct BlockDecoder<'a, R: Read + Seek> {
     thread_count: u32,
     mt_memory_budget: Option<u64>,
+    cancellation: Option<Arc<AtomicBool>>,
     block_index: usize,
     archive: &'a Archive,
     password: &'a Password,
@@ -1857,6 +1878,7 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
         Self {
             thread_count,
             mt_memory_budget: None,
+            cancellation: None,
             block_index,
             archive,
             password,
@@ -1874,6 +1896,12 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
     /// [`ArchiveReader::set_mt_memory_budget`]. By default there is no budget.
     pub fn set_mt_memory_budget(&mut self, budget: u64) {
         self.mt_memory_budget = Some(budget);
+    }
+
+    /// Sets a flag that cancels multi-threaded LZMA2 decoding; see
+    /// [`ArchiveReader::set_cancellation`].
+    pub fn set_cancellation(&mut self, flag: Arc<AtomicBool>) {
+        self.cancellation = Some(flag);
     }
 
     /// Returns a slice of archive entries contained in this block.
@@ -1903,6 +1931,7 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
         let Self {
             thread_count,
             mt_memory_budget,
+            cancellation,
             block_index,
             archive,
             password,
@@ -1911,9 +1940,10 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
         let options = DecodeOptions {
             threads: thread_count,
             mt_memory_budget,
+            cancellation,
         };
         let mut block_reader =
-            ArchiveReader::build_decode_stack(source, archive, block_index, password, options)?;
+            ArchiveReader::build_decode_stack(source, archive, block_index, password, &options)?;
         let start = archive.stream_map.block_first_file_index[block_index];
         let file_count = archive.blocks[block_index].num_unpack_sub_streams;
 

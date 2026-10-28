@@ -1,4 +1,8 @@
-use std::{io, io::Read};
+use std::{
+    io,
+    io::Read,
+    sync::{Arc, atomic::AtomicBool},
+};
 
 #[cfg(feature = "bzip2")]
 use bzip2::read::BzDecoder;
@@ -72,12 +76,14 @@ impl<R: Read> Read for Decoder<R> {
     }
 }
 
-/// How the coders of a block are set up: the threads an LZMA2 coder may decode on, and
-/// the bytes a multi-threaded one may hold to decode ahead (`None`: no bound).
-#[derive(Clone, Copy, Debug)]
+/// How the coders of a block are set up: the threads an LZMA2 coder may decode on, the
+/// bytes a multi-threaded one may hold to decode ahead (`None`: no bound), and the flag
+/// that cancels it.
+#[derive(Clone, Debug)]
 pub(crate) struct DecodeOptions {
     pub(crate) threads: u32,
     pub(crate) mt_memory_budget: Option<u64>,
+    pub(crate) cancellation: Option<Arc<AtomicBool>>,
 }
 
 impl DecodeOptions {
@@ -85,16 +91,18 @@ impl DecodeOptions {
         Self {
             threads,
             mt_memory_budget: None,
+            cancellation: None,
         }
     }
 
     /// The options for one of `coders` LZMA2 coders that decode side by side and share
     /// the budget.
-    pub(crate) fn shared_by(self, coders: usize) -> Self {
+    pub(crate) fn shared_by(&self, coders: usize) -> Self {
         let coders = u64::try_from(coders.max(1)).unwrap_or(u64::MAX);
         Self {
             threads: self.threads,
             mt_memory_budget: self.mt_memory_budget.map(|budget| budget / coders),
+            cancellation: self.cancellation.clone(),
         }
     }
 }
@@ -105,7 +113,7 @@ pub(crate) fn add_decoder<I: Read>(
     coder: &Coder,
     #[allow(unused)] password: &Password,
     max_mem_limit_kb: usize,
-    options: DecodeOptions,
+    options: &DecodeOptions,
 ) -> Result<Decoder<I>, Error> {
     let method = EncoderMethod::by_id(coder.encoder_method_id());
     let method = if let Some(m) = method {
@@ -143,12 +151,17 @@ pub(crate) fn add_decoder<I: Read>(
             let threads = options.threads;
             let lz = if threads < 2 {
                 Decoder::Lzma2(Box::new(Lzma2Reader::new(input, dic_size, None)))
-            } else if let Some(budget) = options.mt_memory_budget {
-                Decoder::Lzma2Mt(Box::new(Lzma2ReaderMt::with_memory_budget(
-                    input, dic_size, None, threads, budget,
-                )))
             } else {
-                Decoder::Lzma2Mt(Box::new(Lzma2ReaderMt::new(input, dic_size, None, threads)))
+                let mut reader = match options.mt_memory_budget {
+                    Some(budget) => {
+                        Lzma2ReaderMt::with_memory_budget(input, dic_size, None, threads, budget)
+                    }
+                    None => Lzma2ReaderMt::new(input, dic_size, None, threads),
+                };
+                if let Some(flag) = &options.cancellation {
+                    reader.set_cancellation(Arc::clone(flag));
+                }
+                Decoder::Lzma2Mt(Box::new(reader))
             };
 
             Ok(lz)
@@ -316,6 +329,7 @@ mod tests {
         let options = DecodeOptions {
             threads: 4,
             mt_memory_budget: Some(10),
+            cancellation: None,
         };
         assert_eq!(options.shared_by(2).mt_memory_budget, Some(5));
         assert_eq!(options.shared_by(3).mt_memory_budget, Some(3));

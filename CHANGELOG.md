@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   what the multi-threaded LZMA2 decoder holds to decode ahead (`Lzma2ReaderMt::with_memory_budget`).
   A block whose work units do not fit is decoded on one thread from the unit that does not fit on.
   The LZMA2 coders of a BCJ2 block share the budget. Without a budget nothing changes.
+- `ArchiveReader::set_cancellation` and `BlockDecoder::set_cancellation` hand a shared flag to the
+  multi-threaded LZMA2 decoder (`Lzma2ReaderMt::set_cancellation`). Once it is set, a read that waits
+  for one of its workers returns an I/O error carrying `lzma_rust2::DecoderCancelled` within 50 ms,
+  instead of once the work unit it waits for is decoded (seconds for a 256 MiB unit).
 
 ## 0.24.1 - 2026-10-18
 
